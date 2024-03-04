@@ -15,11 +15,13 @@ brew install --cask alfred alfred
 brew install --cask visual-studio-code
 brew install --cask docker
 brew install --cask 1password
+brew install --cask google-cloud-sdk
 
 # Install command line tools
 brew install rbenv
 brew install npm
 brew install awscli
+brew install
 
 # Install OhMyZsh
 sh -c "$(curl -fsSL https://raw.github.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
