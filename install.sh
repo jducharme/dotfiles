@@ -20,8 +20,7 @@ brew update
 
 # 2. Peripherals & Hardware (The Irrigation System)
 echo "🖥️ Deploying DisplayLink Manager for Multi-Display Anker Hub..."
-brew tap wwmoraes/tap
-brew install --cask wwmoraes/tap/displaylink-manager
+brew install --cask displaylink
 
 # 3. Virtualization Infrastructure (The Greenhouse)
 echo "🐳 Deploying Docker Desktop (Keeping local databases off the host system)..."
@@ -33,6 +32,8 @@ brew install --cask raycast
 brew install --cask 1password
 brew install --cask 1password-cli
 brew install --cask google-chrome
+brew install --cask notion
+brew install --cask notion-calendar
 
 # 5. Interface, Terminal & DB Utilities
 echo "⚡ Planting Ghostty Terminal, TablePlus, & Starship Prompts..."
