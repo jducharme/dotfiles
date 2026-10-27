@@ -43,3 +43,7 @@ direnv switches the environment whenever you `cd` into those folders. Claude Cod
 - agy (Gemini) has one machine-wide login. Leave gemini out of a work profile unless that employer gave you an API key.
 
 To try a new model, install its CLI (Brewfile or `install.sh`), add a check to `bin/ai-doctor`, then add it to a repo as `LOOP_CMD_<name>` (or as a built-in in `loop/core/review.sh`).
+
+## License
+
+[PolyForm Noncommercial 1.0.0](LICENSE): free for personal, hobby, research and other noncommercial use, as long as the `Required Notice` line stays with every copy. Selling it, or using it in or for a for-profit business, needs a separate license from me.

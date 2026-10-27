@@ -268,6 +268,8 @@ if [ "$MODE" = team ]; then
   rm -rf .agent-loop/core
   cp -R "$CORE" .agent-loop/core
   find .agent-loop/core -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
+  # The license travels with every copy of the engine (its terms require it).
+  [ -f "$LOOP_HOME/../LICENSE" ] && cp "$LOOP_HOME/../LICENSE" .agent-loop/core/LICENSE
   ver="$(git -C "$LOOP_HOME" log -1 --format='%h %cs' -- core 2>/dev/null || true)"
   printf 'agent-loop engine %s, copied by init-loop on %s. Update it by re-running init-loop.\n' \
     "${ver:-(unversioned)}" "$(date +%Y-%m-%d)" > .agent-loop/core/VERSION

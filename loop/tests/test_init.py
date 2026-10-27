@@ -158,6 +158,8 @@ class TeamMode(Base):
         self.init("--mode", "team", "--reviewers", "gemini")
         self.assertTrue(os.path.exists(self.path(".agent-loop", "core", "review.sh")))
         self.assertIn("agent-loop engine", read(self.path(".agent-loop", "core", "VERSION")))
+        if os.path.exists(os.path.join(LOOP_HOME, "..", "LICENSE")):
+            self.assertIn("Required Notice:", read(self.path(".agent-loop", "core", "LICENSE")))
         claude_md = read(self.path("CLAUDE.md"))
         self.assertIn("Use tabs.", claude_md)
         self.assertIn(".agent-loop/LOOP.md", claude_md)

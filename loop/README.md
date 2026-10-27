@@ -53,3 +53,7 @@ A round passes only when the tests pass and each reviewer, on its own, approves,
 ## Changing the loop
 
 Edit `core/`, run `bash loop/tests/run.sh`, commit dotfiles. Local-mode repos pick the change up immediately. Team-mode repos keep their pinned copy until you re-run `init-loop` there.
+
+## License
+
+[PolyForm Noncommercial 1.0.0](../LICENSE). Every copy of the loop, including the pinned engine `init-loop --mode team` puts in a repo, has to keep the `Required Notice` line. Commercial use needs a separate license from me.
