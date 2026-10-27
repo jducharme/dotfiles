@@ -1,0 +1,3 @@
+.DS_Store
+# Karabiner writes its own backups into ~/.config/karabiner, which is a symlink to karabiner/
+karabiner/automatic_backups/

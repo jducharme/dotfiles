@@ -1,0 +1,439 @@
+#!/usr/bin/env bash
+# init-loop: install the agent loop (intent → spec → review → build → review) into a repo.
+#
+#   init-loop [repo] [options]        repo: any folder inside a git repo (default: the current one)
+#
+#   --mode team|local   team:  everything is committed, so teammates get the loop too, including
+#                              a pinned copy of the engine in .agent-loop/core/.
+#                       local: nothing is committed. The files are hidden through .git/info/exclude
+#                              and the engine runs from this machine's install. Use it when the
+#                              team hasn't adopted the loop.
+#                       Default: the mode recorded by an earlier run, else team if the repo already
+#                       has the loop committed, else local.
+#   --reviewers "a b"   models that review (default: this machine's LOOP_REVIEWERS, narrowed to what
+#                       the active account profile allows)
+#   --allowed "a b"     the repo's approved models (LOOP_ALLOWED_REVIEWERS). A review using any other
+#                       model is refused
+#   --profile NAME      the account profile this repo must be reviewed under (default: the active one)
+#   --test-cmd CMD      the repo's test command (default: detected from the repo)
+#   --specs-dir DIR     where specs live (default: specs in team mode, .agent-loop/specs in local mode)
+#   -h, --help
+#
+# Safe to re-run, and re-running is how you update: files the loop owns (engine, commands,
+# LOOP.md, wrapper) are refreshed; files the repo owns (config.sh, guard.sh, test.sh, templates,
+# CLAUDE.md content) are created once and never overwritten. Portable to macOS's bash 3.2.
+set -euo pipefail
+
+# Follow symlinks (install.sh links this script into ~/.local/bin) back to the real loop folder.
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(cd "$(dirname "$src")" && pwd -P)"
+  src="$(readlink "$src")"
+  case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+done
+LOOP_HOME="$(cd "$(dirname "$src")/.." && pwd -P)"
+CORE="$LOOP_HOME/core"
+MARK="agent-loop: managed by init-loop"
+
+die()  { echo "init-loop: $*" >&2; exit 2; }
+ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+note() { printf '  \033[33m!\033[0m %s\n' "$*"; }
+in_list() { # name "list": exact names, or prefix/* (e.g. local/* allows every local model)
+  local e
+  while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    case "$e" in
+      */\*) [ "$1" = "${e%/\*}" ] && return 0; case "$1" in "${e%\*}"*) return 0 ;; esac ;;
+      *) [ "$1" = "$e" ] && return 0 ;;
+    esac
+  done <<LIST
+$(printf '%s' "$2" | tr ' ' '\n')
+LIST
+  return 1
+}
+
+TARGET="."; MODE=""; REVIEWERS=""; ALLOWED=""; PROFILE=""; PROFILE_SET=0; TEST_CMD=""; TEST_SET=0; SPECS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mode) MODE="${2:-}"; shift 2 ;;
+    --reviewers) REVIEWERS="${2:-}"; shift 2 ;;
+    --allowed) ALLOWED="${2:-}"; shift 2 ;;
+    --profile) PROFILE="${2:-}"; PROFILE_SET=1; shift 2 ;;
+    --test-cmd) TEST_CMD="${2:-}"; TEST_SET=1; shift 2 ;;
+    --specs-dir) SPECS="${2:-}"; shift 2 ;;
+    -h|--help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) die "unknown option '$1' (see --help)" ;;
+    *) TARGET="$1"; shift ;;
+  esac
+done
+case "$MODE" in ""|team|local) ;; *) die "--mode must be 'team' or 'local'" ;; esac
+command -v git >/dev/null 2>&1 || die "git not found"
+command -v python3 >/dev/null 2>&1 || die "python3 not found"
+[ -f "$CORE/review.sh" ] || die "the loop engine isn't at $CORE"
+[ -d "$TARGET" ] || die "$TARGET isn't a folder"
+ROOT="$(git -C "$TARGET" rev-parse --show-toplevel 2>/dev/null)" || die "$TARGET isn't inside a git repo (git init first)"
+cd "$ROOT"
+NAME="$(basename "$ROOT")"
+
+# ---- what's already here ------------------------------------------------------------------
+read_local() { # key -> value recorded in .agent-loop/local.sh by an earlier run
+  [ -f .agent-loop/local.sh ] || return 0
+  sed -n "s/^$1=\"\\(.*\\)\"\$/\\1/p" .agent-loop/local.sh | tail -1
+}
+tracked() { git ls-files --error-unmatch "$1" >/dev/null 2>&1; }
+
+PREV_MODE="$(read_local LOOP_MODE)"
+if [ -z "$MODE" ]; then
+  if [ -n "$PREV_MODE" ]; then MODE="$PREV_MODE"
+  elif tracked .agent-loop/config.sh; then MODE=team
+  else MODE=local; fi
+fi
+if [ "$MODE" = local ] && [ -n "$(git ls-files .agent-loop)" ]; then
+  die "this repo already has the loop committed (.agent-loop/), so it can't be hidden: use --mode team"
+fi
+
+if [ "$PROFILE_SET" = 0 ]; then PROFILE="$(read_local LOOP_PROFILE)"; PROFILE="${PROFILE:-${LOOP_ACTIVE_PROFILE:-}}"; fi
+if [ -n "$PROFILE" ] && [ "${LOOP_ACTIVE_PROFILE:-}" != "$PROFILE" ]; then
+  note "this repo will use the '$PROFILE' accounts, but '${LOOP_ACTIVE_PROFILE:-no profile}' is active right now; reviews will refuse to run until '$PROFILE' is"
+fi
+
+# Machine defaults (dotfiles), then the active profile's limits.
+DEF_REVIEWERS=""
+if [ -f "$HOME/.config/agent-loop/defaults.sh" ]; then
+  # shellcheck disable=SC1091
+  DEF_REVIEWERS="$(LOOP_REVIEWERS=""; . "$HOME/.config/agent-loop/defaults.sh"; printf '%s' "$LOOP_REVIEWERS")"
+fi
+if [ -z "$REVIEWERS" ] && [ -f .agent-loop/config.sh ]; then
+  REVIEWERS="$(LOOP_REVIEWERS=""; . .agent-loop/config.sh >/dev/null 2>&1 || true; printf '%s' "$LOOP_REVIEWERS")"
+fi
+if [ -z "$REVIEWERS" ]; then
+  for r in ${DEF_REVIEWERS:-codex gemini}; do
+    if [ -n "${LOOP_PROFILE_REVIEWERS:-}" ] && ! in_list "$r" "$LOOP_PROFILE_REVIEWERS"; then continue; fi
+    if [ -n "$ALLOWED" ] && ! in_list "$r" "$ALLOWED"; then continue; fi
+    REVIEWERS="${REVIEWERS:+$REVIEWERS }$r"
+  done
+  if [ -z "$REVIEWERS" ] && [ -n "${LOOP_PROFILE_REVIEWERS:-}" ]; then
+    # None of the usual reviewers is allowed here: use the ones this profile approves.
+    for r in $LOOP_PROFILE_REVIEWERS; do
+      if [ -n "$ALLOWED" ] && ! in_list "$r" "$ALLOWED"; then continue; fi
+      REVIEWERS="${REVIEWERS:+$REVIEWERS }$r"
+    done
+  fi
+  [ -n "$REVIEWERS" ] || die "none of this machine's default reviewers (${DEF_REVIEWERS:-codex gemini}) is allowed here (profile allows: ${LOOP_PROFILE_REVIEWERS:-anything}; --allowed: ${ALLOWED:-anything}). Pick them with --reviewers \"...\""
+fi
+for r in $REVIEWERS; do
+  if [ -n "$ALLOWED" ] && ! in_list "$r" "$ALLOWED"; then die "reviewer '$r' isn't in --allowed \"$ALLOWED\""; fi
+done
+
+if [ -z "$SPECS" ]; then
+  SPECS="$(read_local LOOP_SPECS_DIR)"
+  if [ -z "$SPECS" ] && [ -f .agent-loop/config.sh ]; then
+    SPECS="$(LOOP_SPECS_DIR=""; . .agent-loop/config.sh >/dev/null 2>&1 || true; printf '%s' "$LOOP_SPECS_DIR")"
+  fi
+  if [ -z "$SPECS" ]; then
+    if [ "$MODE" = local ]; then SPECS=".agent-loop/specs"
+    elif [ -d specs ] && ! ls specs/[0-9][0-9][0-9]-*/spec.md >/dev/null 2>&1 && [ -n "$(ls -A specs)" ]; then
+      SPECS=".agent-loop/specs"   # the repo already uses specs/ for something else
+    else SPECS="specs"; fi
+  fi
+fi
+SPECS="${SPECS%/}"
+
+detect_test_cmd() {
+  if [ -f Makefile ] && grep -qE '^test:' Makefile; then echo "make test"; return; fi
+  if [ -f package.json ] && python3 -c '
+import json, sys
+t = (json.load(open("package.json")).get("scripts") or {}).get("test", "")
+sys.exit(0 if t and "no test specified" not in t else 1)' 2>/dev/null; then
+    if [ -f pnpm-lock.yaml ]; then echo "pnpm test"
+    elif [ -f yarn.lock ]; then echo "yarn test"
+    elif [ -f bun.lockb ] || [ -f bun.lock ]; then echo "bun run test"
+    else echo "npm test"; fi
+    return
+  fi
+  if [ -f pyproject.toml ] || [ -f pytest.ini ] || [ -f setup.cfg ] || [ -f tox.ini ] || [ -d tests ]; then
+    if [ -f uv.lock ]; then echo "uv run pytest"
+    elif [ -f poetry.lock ]; then echo "poetry run pytest"
+    else echo "python3 -m pytest"; fi
+    return
+  fi
+  if [ -f go.mod ]; then echo "go test ./..."; return; fi
+  if [ -f Cargo.toml ]; then echo "cargo test"; return; fi
+  if [ -f Gemfile ] && [ -f Rakefile ]; then echo "bundle exec rake test"; return; fi
+}
+[ "$TEST_SET" = 1 ] || TEST_CMD="$(detect_test_cmd || true)"
+
+RULES=""
+for f in CLAUDE.md AGENTS.md AGENT.md CONTRIBUTING.md .github/copilot-instructions.md; do
+  [ -f "$f" ] && RULES="${RULES:+$RULES }$f"
+done
+
+echo "Installing the agent loop in $ROOT ($MODE mode)"
+
+# ---- helpers --------------------------------------------------------------------------------
+WRITTEN=""   # repo-relative paths this run wrote; local mode hides them
+remember() { WRITTEN="$WRITTEN $1"; }
+
+# managed <dest> <src>: the loop owns dest. Refresh it, unless something else already lives there.
+managed() {
+  local dest="$1" src="$2"
+  mkdir -p "$(dirname "$dest")"
+  if [ -f "$dest" ] && ! grep -qF "$MARK" "$dest"; then
+    note "kept $dest: it isn't the loop's (rename it if you want the loop's version)"
+    return 0
+  fi
+  if [ -f "$dest" ] && cmp -s "$src" "$dest"; then ok "$dest"; else cp "$src" "$dest"; ok "$dest (written)"; fi
+  remember "$dest"
+}
+
+# once <dest>: the repo owns dest. Create it from stdin if it's missing, never overwrite it.
+once() {
+  local dest="$1" tmp
+  tmp="$(mktemp)"; cat > "$tmp"
+  remember "$dest"
+  if [ -e "$dest" ]; then ok "$dest (kept yours)"; rm -f "$tmp"; return 0; fi
+  mkdir -p "$(dirname "$dest")"
+  mv "$tmp" "$dest"
+  ok "$dest (created)"
+}
+
+# block <file> <begin> <end> <comment-prefix>: replace (or add) a marked block with stdin.
+block() {
+  local file="$1" begin="$2" end="$3" body
+  body="$(cat)"
+  mkdir -p "$(dirname "$file")"; touch "$file"
+  BODY="$body" python3 - "$file" "$begin" "$end" <<'PY'
+import os, sys
+path, begin, end = sys.argv[1:4]
+text = open(path, encoding="utf-8").read()
+new = begin + "\n" + os.environ["BODY"].rstrip("\n") + "\n" + end + "\n"
+if begin in text and end in text:
+    pre, rest = text.split(begin, 1)
+    post = rest.split(end, 1)[1].lstrip("\n")
+    text = pre + new + (("\n" + post) if post else "")
+else:
+    text = text.rstrip("\n") + ("\n\n" if text.strip() else "") + new
+open(path, "w", encoding="utf-8").write(text)
+PY
+}
+
+unblock() { # file begin end: remove a marked block
+  [ -f "$1" ] || return 0
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys
+path, begin, end = sys.argv[1:4]
+text = open(path, encoding="utf-8").read()
+if begin in text and end in text:
+    pre, rest = text.split(begin, 1)
+    text = pre.rstrip("\n") + "\n" + rest.split(end, 1)[1].lstrip("\n")
+    open(path, "w", encoding="utf-8").write(text)
+PY
+}
+
+# settings <file>: add the loop's permissions to a Claude Code settings file, keeping everything else.
+settings() {
+  local file="$1"
+  mkdir -p .claude
+  python3 - "$file" "$SPECS" <<'PY'
+import json, os, sys
+path, specs = sys.argv[1], sys.argv[2]
+data = {}
+if os.path.exists(path):
+    try:
+        data = json.load(open(path, encoding="utf-8"))
+    except ValueError:
+        sys.exit("init-loop: %s isn't valid JSON; fix it and re-run" % path)
+perm = data.setdefault("permissions", {})
+want = {
+    "allow": ["Bash(bash .agent-loop/review.sh:*)", "Bash(bash .agent-loop/test.sh:*)",
+              "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)"],
+    "deny": ["Read(./**/.env)", "Read(./**/.env.*)",
+             "Edit(./.agent-loop/guard.sh)", "Edit(./.agent-loop/core/**)", "Edit(./.agent-loop/local.sh)",
+             "Edit(./%s/*/reviews/**)" % specs],
+}
+for key, rules in want.items():
+    have = perm.setdefault(key, [])
+    for r in rules:
+        if r not in have:
+            have.append(r)
+json.dump(data, open(path, "w", encoding="utf-8"), indent=2)
+open(path, "a").write("\n")
+PY
+  ok "$file (loop permissions merged)"
+}
+
+# ---- the engine -----------------------------------------------------------------------------
+mkdir -p .agent-loop
+if [ "$MODE" = team ]; then
+  rm -rf .agent-loop/core
+  cp -R "$CORE" .agent-loop/core
+  find .agent-loop/core -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
+  ver="$(git -C "$LOOP_HOME" log -1 --format='%h %cs' -- core 2>/dev/null || true)"
+  printf 'agent-loop engine %s, copied by init-loop on %s. Update it by re-running init-loop.\n' \
+    "${ver:-(unversioned)}" "$(date +%Y-%m-%d)" > .agent-loop/core/VERSION
+  ok ".agent-loop/core (engine ${ver:-unversioned})"
+fi
+
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+cat > "$tmp/review.sh" <<'WRAP'
+#!/usr/bin/env bash
+# agent-loop: managed by init-loop. Finds the loop engine and runs it; don't edit by hand.
+# Team mode: the pinned copy in .agent-loop/core/. Local mode: .agent-loop/local.sh says where it is.
+set -euo pipefail
+root="$(git rev-parse --show-toplevel)"
+LOOP_CORE=""
+# shellcheck disable=SC1091
+[ -f "$root/.agent-loop/local.sh" ] && . "$root/.agent-loop/local.sh"
+core="${LOOP_CORE:-$root/.agent-loop/core}"
+[ -f "$core/review.sh" ] || { echo "agent-loop: no engine at $core. Re-run init-loop in this repo." >&2; exit 2; }
+exec bash "$core/review.sh" "$@"
+WRAP
+managed .agent-loop/review.sh "$tmp/review.sh"; chmod +x .agent-loop/review.sh
+managed .agent-loop/LOOP.md "$CORE/LOOP.md"
+
+# local.sh: this developer's settings. The keys init-loop owns are rewritten; anything else is kept.
+{
+  echo "# This developer's own agent-loop settings. Never committed. init-loop rewrites the four keys"
+  echo "# below; anything you add after them is kept."
+  echo "LOOP_MODE=\"$MODE\""
+  echo "LOOP_PROFILE=\"$PROFILE\""
+  if [ "$MODE" = local ]; then echo "LOOP_CORE=\"$CORE\""; else echo "LOOP_CORE=\"\""; fi
+  echo "LOOP_SPECS_DIR=\"$SPECS\""
+  [ -f .agent-loop/local.sh ] && grep -vE '^(# This developer|# below; anything|LOOP_MODE=|LOOP_PROFILE=|LOOP_CORE=|LOOP_SPECS_DIR=)' .agent-loop/local.sh || true
+} > "$tmp/local.sh"
+mv "$tmp/local.sh" .agent-loop/local.sh
+ok ".agent-loop/local.sh (mode $MODE${PROFILE:+, profile $PROFILE})"
+
+# ---- the repo's own files (created once) ----------------------------------------------------
+rules_arr=""; for f in $RULES; do rules_arr="$rules_arr $f"; done
+once .agent-loop/config.sh <<EOF
+# agent-loop config for $NAME. Sourced by review.sh (bash 3.2: plain assignments, arrays in ( )).
+# shellcheck disable=SC2034  # read by review.sh
+# See .agent-loop/LOOP.md, and \`bash .agent-loop/review.sh --help\` for every knob.
+
+# Who reviews. Built in: claude, codex, gemini, and local/<name> for a model on Ollama (names come
+# from LOOP_LOCAL_MODELS here or in ~/.config/agent-loop/defaults.sh). A one-off run can override this:
+#   LOOP_REVIEWERS="codex" bash .agent-loop/review.sh …
+LOOP_REVIEWERS="$REVIEWERS"
+LOOP_SPEC_REVIEWERS=""            # who reviews specs; empty = the same as LOOP_REVIEWERS
+
+# The models approved for this repo's code. A review using any other model is refused. Empty = no limit.
+# local/* allows every local model (they never leave the machine).
+LOOP_ALLOWED_REVIEWERS="$ALLOWED"
+
+# Local models this repo adds to the machine's list ("name=ollama-tag ..."), used as local/<name>.
+LOOP_LOCAL_MODELS=""
+
+# Any other model: a command that reads the prompt on stdin and prints the JSON verdict on stdout.
+# Then add its name to LOOP_REVIEWERS. For example (a made-up CLI):
+#   LOOP_CMD_xyz='xyz-ai review --stdin --format json'
+
+# What the reviewers see as <test_results>. Keep it fast and deterministic.
+LOOP_TEST_CMD="bash .agent-loop/test.sh"
+
+# Rules every reviewer gets in full, ahead of the spec.
+LOOP_RULES_FILES=($rules_arr )
+
+# Never sent to any reviewer.
+LOOP_DIFF_EXCLUDES=(
+  ':(exclude,glob)**/.env'
+  ':(exclude,glob)**/.env.*'
+  ':(exclude,glob)**/*.pem'
+  ':(exclude,glob)**/*.key'
+  ':(exclude,glob)**/package-lock.json'
+  ':(exclude,glob)**/pnpm-lock.yaml'
+  ':(exclude,glob)**/yarn.lock'
+  ':(exclude,glob)**/uv.lock'
+  ':(exclude,glob)**/poetry.lock'
+  ':(exclude,glob)**/Cargo.lock'
+  ':(exclude,glob)**/go.sum'
+)
+
+LOOP_SPECS_DIR="$SPECS"
+EOF
+
+once .agent-loop/guard.sh < "$CORE/templates/guard.sh"
+chmod +x .agent-loop/guard.sh
+
+if [ -n "$TEST_CMD" ]; then test_body="$TEST_CMD"; else
+  test_body='echo "NO TESTS CONFIGURED: put this repo'"'"'s test command in .agent-loop/test.sh"; exit 1'
+fi
+once .agent-loop/test.sh <<EOF
+#!/usr/bin/env bash
+# The checks review.sh runs before every code review. Reviewers see the output, and a non-zero exit
+# blocks a pass. This file is the repo's: add linters, type checks, whatever must be green.
+set -uo pipefail
+cd "\$(git rev-parse --show-toplevel)"
+$test_body
+EOF
+chmod +x .agent-loop/test.sh
+
+once .agent-loop/templates/spec.md < "$CORE/templates/spec.md"
+once .agent-loop/templates/log.md < "$CORE/templates/log.md"
+once "$SPECS/README.md" <<EOF
+# Specs
+
+One folder per change: \`NNN-short-slug/\` holding \`spec.md\` (the contract), \`log.md\` (triage decisions) and \`reviews/\`.
+
+Lifecycle: \`draft\` → \`ready\` (open questions settled, spec reviewed, approved by a human) → \`in-progress\` (branch \`spec/NNN-slug\`) → \`in-review\` (loop passed, PR open) → \`done\` (merged).
+
+How the loop works: [\`.agent-loop/LOOP.md\`](../.agent-loop/LOOP.md).
+EOF
+
+# ---- Claude Code: commands and permissions ----------------------------------------------------
+for f in "$CORE"/commands/*.md; do managed ".claude/commands/$(basename "$f")" "$f"; done
+if [ "$MODE" = team ]; then settings .claude/settings.json; else settings .claude/settings.local.json; remember .claude/settings.local.json; fi
+
+# ---- making it visible (team) or invisible (local) -----------------------------------------------
+EXCLUDE="$(git rev-parse --git-path info/exclude)"
+B_IGN="# agent-loop:begin (local mode; managed by init-loop)"; E_IGN="# agent-loop:end"
+B_MD="<!-- agent-loop:begin (managed by init-loop) -->"; E_MD="<!-- agent-loop:end -->"
+if [ "$MODE" = local ]; then
+  list="/.agent-loop/"
+  for p in $WRITTEN; do
+    case "$p" in .agent-loop/*|"$SPECS"/*) ;; *) list="$list
+/$p" ;; esac
+  done
+  case "$SPECS" in .agent-loop/*) ;; *) list="$list
+/$SPECS/" ;; esac
+  printf '%s\n' "$list" | block "$EXCLUDE" "$B_IGN" "$E_IGN"
+  ok "hidden from git via $EXCLUDE (nothing to commit)"
+else
+  unblock "$EXCLUDE" "$B_IGN" "$E_IGN"
+  touch .gitignore
+  for line in ".agent-loop/.runs/" ".agent-loop/local.sh"; do
+    grep -qxF "$line" .gitignore || printf '%s\n' "$line" >> .gitignore
+  done
+  ok ".gitignore (scratch and local.sh never committed)"
+  pointer="## How changes get made here: the agent loop
+Anything that changes behaviour goes through the loop: \`/spec\` → human approval → \`/build\` → \`/review-loop\` → \`/ship\`. Read \`.agent-loop/LOOP.md\` first; specs live in \`$SPECS/\`.
+
+If \`.agent-loop/review.sh\` invoked you as a reviewer, the prompt you received is your whole instruction set: review only, modify nothing, and reply with the JSON verdict."
+  printf '%s\n' "$pointer" | block CLAUDE.md "$B_MD" "$E_MD"; ok "CLAUDE.md (loop section)"
+  for f in AGENTS.md GEMINI.md; do
+    if [ -f "$f" ]; then printf '%s\n' "$pointer" | block "$f" "$B_MD" "$E_MD"; ok "$f (loop section)"; fi
+  done
+fi
+
+# ---- what's next ----------------------------------------------------------------------------------
+missing=""
+for r in $REVIEWERS; do
+  case "$r" in
+    gemini) command -v agy >/dev/null 2>&1 || missing="$missing agy" ;;
+    claude|codex) command -v "$r" >/dev/null 2>&1 || missing="$missing $r" ;;
+  esac
+done
+echo
+echo "Reviewers: $REVIEWERS${ALLOWED:+ (approved for this repo: $ALLOWED)}${PROFILE:+ · accounts: $PROFILE}"
+echo "Tests:     ${TEST_CMD:-none found. Edit .agent-loop/test.sh}"
+echo "Specs:     $SPECS/"
+[ -z "$missing" ] || note "not installed on this machine:$missing (run ai-doctor)"
+echo
+echo "Next:"
+echo "  1. Look over .agent-loop/config.sh, guard.sh and test.sh: they're this repo's to edit."
+if [ "$MODE" = team ]; then
+  echo "  2. Commit: git add .agent-loop .claude CLAUDE.md $SPECS .gitignore && git commit -m 'Add the agent loop'"
+else
+  echo "  2. Nothing to commit: git status stays clean."
+fi
+echo "  3. Open Claude Code here and start with: /spec <what you want to build>"

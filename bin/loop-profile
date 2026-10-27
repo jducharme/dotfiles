@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# loop-profile: which accounts (Claude Code, Codex, GitHub, git identity) and which models a folder uses.
+#
+#   loop-profile                          show the active profile here
+#   loop-profile list                     list profiles
+#   loop-profile new <name> [--email E] [--reviewers "a b"]
+#                                         create a profile (e.g. one per employer)
+#   loop-profile login <name> [claude|codex|gh|all]
+#                                         sign that profile's accounts in, kept apart from your personal ones
+#   loop-profile use <name> <folder>      make every repo under <folder> use it (writes <folder>/.envrc for direnv)
+#
+# Profiles live in ~/.config/agent-loop/profiles/<name>.sh and their logins in
+# ~/.config/agent-loop/accounts/<name>/. Managed in dotfiles (bin/loop-profile). bash 3.2-safe.
+set -euo pipefail
+
+CONF="$HOME/.config/agent-loop"
+PROFILES="$CONF/profiles"
+TEMPLATE="$(cd "$(dirname "$(readlink "$0" 2>/dev/null || echo "$0")")/.." 2>/dev/null && pwd -P)/ai/profiles/template.sh"
+die() { echo "loop-profile: $*" >&2; exit 2; }
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+
+valid_name() { case "$1" in ""|*[!a-z0-9_-]*|[!a-z]*) die "profile names are lowercase letters, digits, - and _" ;; esac; }
+profile_file() { echo "$PROFILES/$1.sh"; }
+need_profile() { [ -f "$(profile_file "$1")" ] || die "no profile '$1' (loop-profile list)"; }
+
+cmd_status() {
+  echo "Active profile: ${LOOP_ACTIVE_PROFILE:-none}"
+  echo "  allowed reviewers: ${LOOP_PROFILE_REVIEWERS:-any}"
+  echo "  claude:  ${CLAUDE_CONFIG_DIR:-default login}$([ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && echo " (profile token)")"
+  echo "  codex:   ${CODEX_HOME:-default login}"
+  echo "  gh:      ${GH_CONFIG_DIR:-default login}"
+  echo "  git:     ${GIT_AUTHOR_EMAIL:-$(git config user.email 2>/dev/null || echo '?')}"
+  [ -z "${LOOP_PROFILE_WARNINGS:-}" ] || echo "  ! ${LOOP_PROFILE_WARNINGS}"
+  return 0
+}
+
+cmd_list() {
+  [ -d "$PROFILES" ] || { echo "no profiles yet"; return; }
+  for f in "$PROFILES"/*.sh; do
+    [ -e "$f" ] || continue
+    n="$(basename "$f" .sh)"
+    r="$(sed -n 's/^export LOOP_PROFILE_REVIEWERS="\(.*\)"$/\1/p' "$f" | head -1)"
+    printf '  %s%s  reviewers: %s\n' "$n" "$([ "$n" = "${LOOP_ACTIVE_PROFILE:-}" ] && echo ' (active)')" "${r:-any}"
+  done
+}
+
+cmd_new() {
+  local name="${1:-}" email="" reviewers="" f
+  valid_name "$name"; shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --email) email="${2:-}"; shift 2 ;;
+      --reviewers) reviewers="${2:-}"; shift 2 ;;
+      *) die "unknown option '$1'" ;;
+    esac
+  done
+  [ "$name" != personal ] || die "personal comes with dotfiles"
+  f="$(profile_file "$name")"
+  [ ! -e "$f" ] || die "$f already exists; edit it directly"
+  [ -f "$TEMPLATE" ] || die "template not found at $TEMPLATE"
+  [ -n "$email" ] || email="$(git config user.email 2>/dev/null || true)"
+  mkdir -p "$PROFILES"
+  for d in claude codex gh; do mkdir -p "$CONF/accounts/$name/$d"; done
+  chmod 700 "$CONF/accounts" "$CONF/accounts/$name"
+  sed -e "s/__NAME__/$name/g" -e "s/__EMAIL__/$email/g" -e "s/__REVIEWERS__/$reviewers/g" "$TEMPLATE" > "$f"
+  echo "Created $f"
+  [ -n "$reviewers" ] || echo "  ! no --reviewers given: set LOOP_PROFILE_REVIEWERS in it to the models this employer approved"
+  echo "Next:"
+  echo "  loop-profile login $name all       sign in its Claude Code, Codex and GitHub accounts"
+  echo "  loop-profile use $name ~/Work/<company>   every repo under that folder then uses it"
+}
+
+cmd_login() {
+  local name="${1:-}" what="${2:-all}"
+  valid_name "$name"; need_profile "$name"
+  [ "$name" != personal ] || die "personal uses the normal logins: claude, codex login, gh auth login"
+  # shellcheck disable=SC1090
+  . "$(profile_file "$name")"
+  case "$what" in claude|codex|gh|all) ;; *) die "login what? claude, codex, gh or all" ;; esac
+  if [ "$what" = claude ] || [ "$what" = all ]; then
+    echo "== Claude Code ($name). A browser opens: sign in with the $name account, and copy the token it prints."
+    env -u CLAUDE_CODE_OAUTH_TOKEN claude setup-token
+    echo "Now paste that token at the Keychain prompt (twice). It's stored as agent-loop.$name.claude."
+    # -w last makes security prompt for it, so the token never appears in a command line.
+    security add-generic-password -U -a "$USER" -s "agent-loop.$name.claude" -w
+    echo "Stored. Folders using '$name' pick it up next time you cd into them."
+  fi
+  if [ "$what" = codex ] || [ "$what" = all ]; then
+    echo "== Codex ($name): sign in with the $name account"
+    codex login
+  fi
+  if [ "$what" = gh ] || [ "$what" = all ]; then
+    echo "== GitHub CLI ($name)"
+    gh auth login
+  fi
+}
+
+cmd_use() {
+  local name="${1:-}" dir="${2:-}" line
+  valid_name "$name"; need_profile "$name"
+  [ -n "$dir" ] && [ -d "$dir" ] || die "usage: loop-profile use <name> <existing folder>"
+  dir="$(cd "$dir" && pwd -P)"
+  line="source_env \"\$HOME/.config/agent-loop/profiles/$name.sh\"   # loop-profile: $name"
+  if [ -f "$dir/.envrc" ] && grep -q '# loop-profile:' "$dir/.envrc"; then
+    grep -v '# loop-profile:' "$dir/.envrc" > "$dir/.envrc.tmp" || true
+    mv "$dir/.envrc.tmp" "$dir/.envrc"
+  fi
+  printf '%s\n' "$line" >> "$dir/.envrc"
+  if command -v direnv >/dev/null 2>&1; then direnv allow "$dir"; else echo "  ! direnv isn't installed (re-run dotfiles install.sh)"; fi
+  echo "Every folder under $dir now uses the '$name' accounts."
+  echo "Open a new terminal there (or cd out and back in), then check with: loop-profile"
+}
+
+case "${1:-status}" in
+  status) cmd_status ;;
+  list) cmd_list ;;
+  new) shift; cmd_new "$@" ;;
+  login) shift; cmd_login "$@" ;;
+  use) shift; cmd_use "$@" ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

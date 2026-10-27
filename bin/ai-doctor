@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# ai-doctor: is every model tool on this Mac installed, signed in, and answering?
+#
+#   ai-doctor          checks what's installed and signed in. Sends nothing to any model.
+#   ai-doctor --live   also sends each model one tiny prompt and checks it answers (uses a little quota)
+#
+# The loop's needs come from ~/.config/agent-loop/defaults.sh (LOOP_AUTHOR, LOOP_SPEC_REVIEWERS,
+# LOOP_REVIEWERS). A needed tool that isn't ready exits 1; anything else is only reported.
+# Managed in dotfiles (bin/ai-doctor). Portable to macOS's bash 3.2.
+set -uo pipefail
+
+LIVE=0
+case "${1:-}" in
+  "") ;;
+  --live) LIVE=1 ;;
+  -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) echo "usage: ai-doctor [--live]" >&2; exit 2 ;;
+esac
+
+LOOP_AUTHOR="claude"; LOOP_SPEC_REVIEWERS=""; LOOP_REVIEWERS=""
+LOOP_LOCAL_MODELS=""; LOOP_OLLAMA_URL="http://127.0.0.1:11434"; REPO_LOCAL_MODELS=""
+DEFAULTS="${LOOP_DEFAULTS:-$HOME/.config/agent-loop/defaults.sh}"
+# shellcheck disable=SC1090
+[ -f "$DEFAULTS" ] && . "$DEFAULTS"
+ROLES_FROM="${DEFAULTS/#$HOME/\~}"
+# Inside a repo with the loop, that repo's reviewers are what matter.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -n "$REPO_ROOT" ] && [ -f "$REPO_ROOT/.agent-loop/config.sh" ]; then
+  # shellcheck disable=SC1091
+  eval "$(cd "$REPO_ROOT" && LOOP_REVIEWERS="" LOOP_SPEC_REVIEWERS="" LOOP_LOCAL_MODELS="" && . .agent-loop/config.sh >/dev/null 2>&1;
+          printf 'LOOP_REVIEWERS=%q; LOOP_SPEC_REVIEWERS=%q; REPO_LOCAL_MODELS=%q' "$LOOP_REVIEWERS" "$LOOP_SPEC_REVIEWERS" "$LOOP_LOCAL_MODELS")"
+  ROLES_FROM="this repo's .agent-loop/config.sh"
+fi
+in_list() { # name "list": exact names, or prefix/* (e.g. local/* allows every local model)
+  local e
+  while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    case "$e" in
+      */\*) [ "$1" = "${e%/\*}" ] && return 0; case "$1" in "${e%\*}"*) return 0 ;; esac ;;
+      *) [ "$1" = "$e" ] && return 0 ;;
+    esac
+  done <<LIST
+$(printf '%s' "$2" | tr ' ' '\n')
+LIST
+  return 1
+}
+
+# The active account profile may only send code to some models.
+if [ -n "${LOOP_PROFILE_REVIEWERS:-}" ]; then
+  narrowed=""
+  for r in $LOOP_SPEC_REVIEWERS $LOOP_REVIEWERS; do
+    in_list "$r" "$LOOP_PROFILE_REVIEWERS" && narrowed="$narrowed $r"
+  done
+  NEEDED=" $LOOP_AUTHOR $narrowed "
+else
+  NEEDED=" $LOOP_AUTHOR $LOOP_SPEC_REVIEWERS $LOOP_REVIEWERS "
+fi
+LIVE_TIMEOUT="${AI_DOCTOR_TIMEOUT:-120}"      # seconds per model; the local model gets 3x (first load)
+PROMPT="Reply with the single word PONG and nothing else."
+
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/ai-doctor.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+FAIL=0
+
+needed() { case "$NEEDED" in *" $1 "*) return 0 ;; esac; return 1; }
+have()   { command -v "$1" >/dev/null 2>&1; }
+
+# report <name> ok|bad|missing|info <detail>. bad/missing only fail the run for a tool the loop
+# needs; a tool the loop doesn't use shows "!" when broken and "–" when simply not installed.
+report() {
+  local name="$1" st="$2" detail="$3" mark role=""
+  needed "$name" && role=" [loop]"
+  if [ "$st" = bad ] || [ "$st" = missing ]; then
+    if needed "$name"; then FAIL=1; st=fail; elif [ "$st" = missing ]; then st=info; fi
+  fi
+  case "$st" in
+    ok)   mark=$'\033[32m✓\033[0m' ;;
+    info) mark=$'\033[2m–\033[0m' ;;
+    fail) mark=$'\033[31m✗\033[0m' ;;
+    *)    mark=$'\033[33m!\033[0m' ;;
+  esac
+  printf ' %s %-14s %s%s\n' "$mark" "$name" "$detail" "$role"
+}
+
+# tree_pids <pid>: the pid and all its descendants. CLIs leave helpers behind (agy's language
+# server, for one), so a timeout has to stop the whole tree.
+tree_pids() {
+  local child
+  echo "$1"
+  for child in $(pgrep -P "$1" 2>/dev/null); do tree_pids "$child"; done
+}
+
+# with_timeout <secs> <cmd...>: macOS has no `timeout`. Runs cmd; after secs, stops it and
+# everything it started, and returns 124.
+with_timeout() {
+  local secs="$1" pid watcher rc
+  shift
+  "$@" &
+  pid=$!
+  (
+    i=0
+    while [ "$i" -lt "$secs" ]; do
+      sleep 1
+      kill -0 "$pid" 2>/dev/null || exit 0
+      i=$((i + 1))
+    done
+    pids="$(tree_pids "$pid")"
+    touch "$TMP/timeout.$pid"
+    # shellcheck disable=SC2086  # a list of pids
+    kill -TERM $pids 2>/dev/null
+    for _ in 1 2 3 4 5; do
+      alive=""
+      for p in $pids; do kill -0 "$p" 2>/dev/null && alive="$alive $p"; done
+      [ -z "$alive" ] && exit 0
+      sleep 1
+    done
+    # shellcheck disable=SC2086
+    kill -KILL $alive 2>/dev/null
+  ) >/dev/null 2>&1 &
+  watcher=$!
+  wait "$pid"; rc=$?
+  if [ -e "$TMP/timeout.$pid" ]; then
+    wait "$watcher" 2>/dev/null       # let it finish the KILL pass on anything that ignored TERM
+    rc=124
+  else
+    kill "$watcher" 2>/dev/null; wait "$watcher" 2>/dev/null
+  fi
+  return "$rc"
+}
+
+# ask <name> <secs> <cmd...>: run a one-prompt check in an empty folder; true if PONG comes back.
+ask() {
+  local name="$1" secs="$2" rc
+  shift 2
+  mkdir -p "$TMP/$name"
+  ( cd "$TMP/$name" && with_timeout "$secs" "$@" ) < /dev/null > "$TMP/$name.out" 2>&1
+  rc=$?
+  [ "$rc" -eq 124 ] && echo "(timed out after ${secs}s)" >> "$TMP/$name.out"
+  grep -q PONG "$TMP/$name.out" "$TMP/$name"/* 2>/dev/null
+}
+
+# why <name>: the last non-empty output line, for the report.
+why() { grep -v '^[[:space:]]*$' "$TMP/$1.out" 2>/dev/null | tail -1 | cut -c1-90; }
+
+version() { "$@" --version 2>/dev/null | head -1 | tr -d '\r'; }
+
+# ---- models ----------------------------------------------------------------------------------
+check_claude() {
+  have claude || { report claude missing "not installed: brew install --cask claude-code"; return; }
+  local v; v="$(version claude)"
+  if [ "$LIVE" = 0 ]; then report claude ok "${v:-installed} (--live checks sign-in)"; return; fi
+  if ask claude "$LIVE_TIMEOUT" claude -p "$PROMPT"; then report claude ok "$v · answered"
+  else report claude bad "$v · no answer: run \`claude\` once to sign in. Last output: $(why claude)"; fi
+}
+
+check_codex() {
+  have codex || { report codex missing "not installed: brew install --cask codex"; return; }
+  local v; v="$(version codex)"
+  if ! codex login status >/dev/null 2>&1; then report codex bad "$v · not signed in: codex login"; return; fi
+  if [ "$LIVE" = 0 ]; then report codex ok "$v · signed in"; return; fi
+  local args="exec --sandbox read-only"
+  codex exec --help 2>&1 | grep -q -- '--skip-git-repo-check' && args="$args --skip-git-repo-check"
+  codex exec --help 2>&1 | grep -q -- '--ephemeral' && args="$args --ephemeral"
+  # shellcheck disable=SC2086  # args is a list of known flags
+  if ask codex "$LIVE_TIMEOUT" codex $args -o last.txt "$PROMPT"; then report codex ok "$v · answered"
+  else report codex bad "$v · no answer. Last output: $(why codex)"; fi
+}
+
+check_gemini() {
+  have agy || { report gemini missing "agy not installed: brew install --cask antigravity-cli"; return; }
+  local v; v="$(version agy)"
+  if [ "$LIVE" = 0 ]; then report gemini ok "agy ${v:-installed} (--live checks sign-in)"; return; fi
+  if ask gemini "$LIVE_TIMEOUT" agy --output-format json --print-timeout 2m --mode plan -p "$PROMPT"; then
+    report gemini ok "agy $v · answered"
+  else report gemini bad "agy $v · no answer: run \`agy\` once to sign in, or \`agy update\`. Last output: $(why gemini)"; fi
+}
+
+check_grok() {
+  have grok || { report grok missing "not installed: ./install.sh --grok (in dotfiles)"; return; }
+  local v; v="$(version grok)"
+  if [ "$LIVE" = 0 ]; then report grok ok "${v:-installed} (--live checks sign-in)"; return; fi
+  if ask grok "$LIVE_TIMEOUT" grok -p "$PROMPT"; then report grok ok "$v · answered"
+  else report grok bad "$v · no answer: run \`grok\` once to sign in (or set XAI_API_KEY). Last output: $(why grok)"; fi
+}
+
+local_model() { # local/<name> -> Ollama tag (same rules as the loop's review.sh)
+  local want="${1#local}" pair
+  want="${want#/}"
+  if [ -z "$want" ]; then
+    for pair in $REPO_LOCAL_MODELS $LOOP_LOCAL_MODELS; do printf '%s' "${pair#*=}"; return; done
+    printf '%s' "qwen3.6:35b-a3b"; return
+  fi
+  for pair in $REPO_LOCAL_MODELS $LOOP_LOCAL_MODELS; do
+    case "$pair" in "$want="*) printf '%s' "${pair#*=}"; return ;; esac
+  done
+  printf '%s' "$want"
+}
+
+check_local() { # every named local model, plus any local/<x> the loop needs
+  local url="$LOOP_OLLAMA_URL" tags r model list="" pair slug body used=""
+  for r in $NEEDED; do case "$r" in local|local/*) list="$list $r" ;; esac; done
+  for pair in $REPO_LOCAL_MODELS $LOOP_LOCAL_MODELS; do
+    r="local/${pair%%=*}"
+    case " $list " in *" $r "*) ;; *) list="$list $r" ;; esac
+  done
+  [ -n "$list" ] || { report local info "no local models named (LOOP_LOCAL_MODELS in defaults.sh)"; return; }
+  if ! have curl || ! have python3; then report local bad "needs curl and python3"; return; fi
+  if ! tags="$(curl -fsS --max-time 3 "$url/api/tags" 2>/dev/null)"; then
+    for r in $list; do report "$r" bad "Ollama isn't answering at $url: open the Ollama app (or run: ollama serve)"; done
+    return
+  fi
+  printf '%s' "$tags" | python3 -c '
+import json, sys
+for m in json.load(sys.stdin).get("models", []):
+    print(m.get("name", ""))' > "$TMP/pulled" 2>/dev/null || : > "$TMP/pulled"
+  for r in $list; do
+    model="$(local_model "$r")"
+    used="$used
+$model
+$model:latest"
+    if ! grep -qxF -e "$model" -e "$model:latest" "$TMP/pulled"; then
+      report "$r" bad "$model isn't pulled: ollama pull $model (or ./install.sh --models)"; continue
+    fi
+    if [ "$LIVE" = 0 ]; then report "$r" ok "$model pulled"; continue; fi
+    slug="$(printf '%s' "$r" | tr -c 'a-z0-9_-' '-')"
+    body="$(python3 -c 'import json, sys; print(json.dumps({"model": sys.argv[1], "prompt": sys.argv[2], "stream": False}))' "$model" "$PROMPT")"
+    if ask "$slug" "$((LIVE_TIMEOUT * 3))" curl -fsS --max-time "$((LIVE_TIMEOUT * 3))" "$url/api/generate" -d "$body"; then
+      report "$r" ok "$model · answered"
+    else report "$r" bad "$model · no answer. Last output: $(why "$slug")"; fi
+  done
+  printf '%s\n' "$used" | grep -v '^$' > "$TMP/used" || true
+  others="$(grep -vxF -f "$TMP/used" "$TMP/pulled" | tr '\n' ' ' || true)"
+  [ -z "$others" ] || report local info "also on Ollama, unnamed: ${others% } (use as local/<tag>, or name them in LOOP_LOCAL_MODELS)"
+}
+
+# ---- supporting tools --------------------------------------------------------------------------
+check_extras() {
+  if have gh; then
+    if gh auth status >/dev/null 2>&1; then report gh ok "signed in"; else report gh bad "not signed in: gh auth login"; fi
+  else report gh missing "not installed: brew install gh"; fi
+
+  if have claude; then
+    with_timeout 30 claude mcp list > "$TMP/mcp.out" 2>/dev/null < /dev/null
+    if grep -qi figma "$TMP/mcp.out"; then report figma ok "MCP server set up in Claude Code"
+    else report figma bad "MCP server not set up in Claude Code: re-run ./install.sh"; fi
+  fi
+
+  if have orca || [ -d /Applications/Orca.app ]; then report orca ok "installed"
+  else report orca info "not installed (optional): brew install --cask stablyai/orca/orca"; fi
+}
+
+printf 'Accounts: %s profile' "${LOOP_ACTIVE_PROFILE:-no}"
+[ -n "${LOOP_PROFILE_REVIEWERS:-}" ] && printf ' (may send code to: %s)' "$LOOP_PROFILE_REVIEWERS"
+printf '\n'
+[ -z "${LOOP_PROFILE_WARNINGS:-}" ] || printf '  \033[33m!\033[0m %s\n' "$LOOP_PROFILE_WARNINGS"
+printf 'Loop roles (from %s):\n  author: %s · spec reviewers: %s · code reviewers: %s\n\n' \
+  "$ROLES_FROM" "$LOOP_AUTHOR" "${LOOP_SPEC_REVIEWERS:-same}" "${LOOP_REVIEWERS:-none}"
+[ "$LIVE" = 1 ] && echo "Sending each model one tiny prompt…"
+check_claude
+check_codex
+check_gemini
+check_grok
+check_local
+echo
+check_extras
+
+echo
+if [ "$FAIL" = 0 ]; then echo "Everything the loop needs is ready."
+else echo "Something the loop needs isn't ready (✗ above)."; fi
+exit "$FAIL"

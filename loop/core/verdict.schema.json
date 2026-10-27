@@ -1,0 +1,44 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "acceptance_criteria", "findings", "missing_tests"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["approve", "request_changes"] },
+    "summary": { "type": "string", "description": "2-4 sentences: overall assessment." },
+    "acceptance_criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "evidence"],
+        "properties": {
+          "id": { "type": "string", "description": "AC id from the spec, e.g. AC-3" },
+          "status": { "type": "string", "enum": ["met", "partial", "not_met", "untestable"] },
+          "evidence": { "type": "string", "description": "file:line and/or test name" }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "category", "file", "line", "title", "detail", "suggested_fix", "acceptance_criterion"],
+        "properties": {
+          "severity": { "type": "string", "enum": ["blocker", "major", "minor", "nit"] },
+          "category": {
+            "type": "string",
+            "enum": ["correctness", "security", "privacy", "tests", "spec-drift", "spec-quality", "performance", "maintainability"]
+          },
+          "file": { "type": "string" },
+          "line": { "type": "integer" },
+          "title": { "type": "string" },
+          "detail": { "type": "string" },
+          "suggested_fix": { "type": "string" },
+          "acceptance_criterion": { "type": "string" }
+        }
+      }
+    },
+    "missing_tests": { "type": "array", "items": { "type": "string" } }
+  }
+}

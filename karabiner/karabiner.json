@@ -1,0 +1,14 @@
+{
+  "profiles": [
+    {
+      "name": "GardenGnome Intercom Profile",
+      "selected": true,
+      "simple_modifications": [
+        {
+          "from": { "key_code": "right_option" },
+          "to": [ { "key_code": "f18" } ]
+        }
+      ]
+    }
+  ]
+}
